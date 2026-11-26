@@ -1,0 +1,30 @@
+# Adapted from the old user-provided "пример правила.txt".
+# Dry-run import does NOT change nftables. Real traffic changes only after Deploy.
+version: 1
+policies:
+  - id: HBF-001
+    name: QA-DROP-KALI01-8080
+    description: "Block TCP 8080 from Kali-1 to Kali-2 (lab example)"
+    enabled: true
+    source: kali01
+    destination: kali02
+    family: ipv4
+    protocol: tcp
+    destination_port: 8080
+    action: drop
+    priority: 100
+
+  # Original HBF-002 denied SSH/22 from Kali-2 to Kali-1.
+  # HBF intentionally PROTECTS management port 22 (and 8088), even in disabled rules.
+  # This safe, DISABLED example substitutes port 59022. It is NOT an SSH block.
+  - id: HBF-002
+    name: QA-DISABLED-NONSSH-59022
+    description: "Disabled non-management test on port 59022; does NOT block SSH/22"
+    enabled: false
+    source: kali02
+    destination: kali01
+    family: ipv4
+    protocol: tcp
+    destination_port: 59022
+    action: drop
+    priority: 100

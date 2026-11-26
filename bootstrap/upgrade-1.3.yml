@@ -1,0 +1,229 @@
+---
+# Lab-only upgrade from installed HBF Alpha 1.1 R2 to Alpha 1.3 R2.
+# Does NOT change live nftables; first new policy deployment is a separate action.
+- name: HBF Alpha 1.3 - preflight CLEAN all agents
+  hosts: hbf_nodes
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Validate previous agent is installed and CLEAN
+      ansible.builtin.command: /usr/local/sbin/hbf-alpha-agent status
+      register: hbf_before
+      changed_when: false
+
+    - name: Require CLEAN and committed policy present
+      ansible.builtin.assert:
+        that:
+          - (hbf_before.stdout | from_json).state == 'CLEAN'
+          - (hbf_before.stdout | from_json).boot_policy | bool
+        fail_msg: 'Unsafe upgrade: previous policy not committed or transaction pending'
+
+- name: HBF Alpha 1.3 - backup database, files, and refuse unresolved deployment
+  hosts: controller
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Ensure controller has no running or unresolved PARTIAL jobs
+      ansible.builtin.shell: |
+        /usr/bin/python3 - <<'PY'
+        import sqlite3,sys
+        db='/var/lib/hbf-alpha-controller/controller.sqlite3'
+        c=sqlite3.connect(f'file:{db}?mode=ro',uri=True)
+        n=c.execute("SELECT count(*) FROM deployments WHERE state IN ('running','partial')").fetchone()[0]
+        if n: sys.exit('Unresolved deployment(s): '+str(n))
+        print('PRE-FLIGHT: no running or partial jobs')
+        PY
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Save date-stamped SQLite and source backups before changes
+      ansible.builtin.shell: |
+        set -euo pipefail
+        /usr/bin/python3 - <<'PY'
+        from pathlib import Path
+        import datetime,sqlite3,subprocess
+        base=Path('/var/lib/hbf-alpha-controller/upgrades')
+        base.mkdir(parents=True,exist_ok=True,mode=0o700)
+        tag=datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+        dst=base/('before-alpha13-'+tag)
+        dst.mkdir(mode=0o700)
+        src=sqlite3.connect('/var/lib/hbf-alpha-controller/controller.sqlite3')
+        db=sqlite3.connect(str(dst/'controller.sqlite3'))
+        src.backup(db)
+        db.close();src.close()
+        (dst/'controller.sqlite3').chmod(0o600)
+        subprocess.run(['/bin/tar','-czf',str(dst/'controller-code.tar.gz'),'-C','/opt/hbf-alpha','controller'],check=True)
+        subprocess.run(['/bin/cp','-p','/etc/hbf-alpha-controller/hosts.json',str(dst/'hosts.json')],check=True)
+        subprocess.run(['/bin/chmod','0600',str(dst/'controller-code.tar.gz'),str(dst/'hosts.json')],check=True)
+        print('BACKUP_PATH='+str(dst))
+        PY
+      args:
+        executable: /bin/bash
+      changed_when: true
+      register: hbf_backups
+
+    - name: Show backup location
+      ansible.builtin.debug:
+        var: hbf_backups.stdout
+
+- name: HBF Alpha 1.3 - temporarily pause web UI
+  hosts: controller
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Stop web console before updating agents
+      ansible.builtin.systemd_service:
+        name: hbf-alpha-console.service
+        state: stopped
+
+- name: HBF Alpha 1.3 - upgrade agents before enabling new web policies
+  hosts: hbf_nodes
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Backup original restricted agent
+      ansible.builtin.copy:
+        src: /usr/local/sbin/hbf-alpha-agent
+        dest: /usr/local/sbin/hbf-alpha-agent.pre-alpha13.bak
+        remote_src: true
+        owner: root
+        group: root
+        mode: '0700'
+        force: false
+
+    - name: Install Alpha 1.3 restricted agent
+      ansible.builtin.copy:
+        src: ../agent/hbf-alpha-agent
+        dest: /usr/local/sbin/hbf-alpha-agent
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Configure restricted quarantine control SSH source (root owned)
+      ansible.builtin.copy:
+        dest: /etc/hbf-alpha/quarantine-admin-ip
+        owner: root
+        group: root
+        mode: '0644'
+        content: "{{ hostvars[groups['controller'][0]].hbf_host_ip }}\n"
+
+    - name: Permit only exact quarantine agent operations via sudo
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/hbf-alpha-agent
+        owner: root
+        group: root
+        mode: '0440'
+        validate: '/usr/sbin/visudo -cf %s'
+        content: |
+          Defaults:agent_hbf !requiretty
+          agent_hbf ALL=(root) NOPASSWD: /usr/local/sbin/hbf-alpha-agent status, /usr/local/sbin/hbf-alpha-agent stage, /usr/local/sbin/hbf-alpha-agent arm, /usr/local/sbin/hbf-alpha-agent apply, /usr/local/sbin/hbf-alpha-agent verify, /usr/local/sbin/hbf-alpha-agent commit, /usr/local/sbin/hbf-alpha-agent rollback, /usr/local/sbin/hbf-alpha-agent quarantine-on, /usr/local/sbin/hbf-alpha-agent quarantine-off
+
+    - name: Dry-run nft syntax for Alpha 1.3 features (no firewall changes)
+      ansible.builtin.shell: |
+        set -Eeuo pipefail
+        test -x /usr/sbin/nft
+        python3 - <<'PY'
+        import importlib.machinery, importlib.util, os, pathlib, subprocess, tempfile
+        path='/usr/local/sbin/hbf-alpha-agent'
+        loader=importlib.machinery.SourceFileLoader('hbf_agent_nft_smoke', path)
+        spec=importlib.util.spec_from_loader(loader.name,loader)
+        agent=importlib.util.module_from_spec(spec);loader.exec_module(agent)
+        base={'id':'P-check1','direction':'output','family':'ipv4',
+              'source':['192.168.100.10/32'],'destination':['192.168.100.20/32'],
+              'proto':'tcp','ports':[[443,443],[9000,9003]],'action':'drop',
+              'states':['new','established'],'log_drop':True,'icmp_type':'','priority':100}
+        variants=[base,
+          {**base,'id':'P-check2','proto':'udp','ports':[[5353,5353]],'action':'reject',
+           'states':[],'log_drop':False,'priority':200},
+          {**base,'id':'P-check3','proto':'icmp','ports':[],'icmp_type':'echo-request',
+           'action':'accept','states':[],'log_drop':False,'priority':10},
+          {**base,'id':'P-check4','family':'ipv6','source':['fd00:abcd::10/128'],
+           'destination':['fd00:abcd::20/128'],'proto':'tcp','ports':[[443,443]],
+           'action':'accept','states':['new'],'log_drop':False,'priority':10},
+          {**base,'id':'P-check5','family':'ipv6','source':['fd00:abcd::10/128'],
+           'destination':['fd00:abcd::20/128'],'proto':'icmpv6','ports':[],
+           'icmp_type':'echo-request','action':'drop','states':[],
+           'log_drop':False,'priority':100}]
+        script=agent.compile_nft(variants)
+        fd,tmp=tempfile.mkstemp(prefix='hbf-alpha13-check-',suffix='.nft',dir='/run')
+        try:
+            with os.fdopen(fd,'w') as f: f.write(script)
+            subprocess.run(['/usr/sbin/nft','-c','-f',tmp],check=True)
+        finally:
+            pathlib.Path(tmp).unlink(missing_ok=True)
+        script=agent.quarantine_rules('{{ hostvars[groups["controller"][0]].hbf_host_ip }}')
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.nft', dir='/run', delete=False) as f:
+            qfile=pathlib.Path(f.name)
+            f.write(script)
+        try:
+            subprocess.run(['/usr/sbin/nft','-c','-f',str(qfile)],check=True)
+        finally:
+            qfile.unlink(missing_ok=True)
+        print('NFT_POLICY_AND_QUARANTINE_SYNTAX_CHECK=PASS; no live changes')
+        PY
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Verify agent v3 is CLEAN without changing live firewall
+      ansible.builtin.command: /usr/local/sbin/hbf-alpha-agent status
+      register: hbf_after
+      changed_when: false
+      failed_when: >-
+        (hbf_after.stdout | from_json).state != 'CLEAN' or
+        (hbf_after.stdout | from_json).schema | int != 3
+
+- name: HBF Alpha 1.3 - install controller and enable web UI
+  hosts: controller
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Install controller source and UI (preserve database and keys)
+      ansible.builtin.copy:
+        src: ../controller/
+        dest: /opt/hbf-alpha/controller/
+        owner: root
+        group: root
+        mode: preserve
+        directory_mode: '0755'
+
+    - name: Update enrolled IPv6 addresses from inventory, if defined
+      ansible.builtin.copy:
+        dest: /etc/hbf-alpha-controller/hosts.json
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [
+          {% for host in groups['hbf_nodes'] %}
+            {"id": {{ host | to_json }}, "ip": {{ hostvars[host].hbf_host_ip | to_json }}, "ipv6": {{ (hostvars[host].hbf_host_ipv6 | default(none)) | to_json }}, "label": {{ host | to_json }}}{% if not loop.last %},{% endif %}
+          {% endfor %}
+          ]
+
+    - name: Check Python syntax before service restart
+      ansible.builtin.command: /opt/hbf-alpha/venv/bin/python -m py_compile /opt/hbf-alpha/controller/app.py /opt/hbf-alpha/controller/topology.py
+      changed_when: false
+
+    - name: Start upgraded web UI (runs additive SQLite migration on startup)
+      ansible.builtin.systemd_service:
+        name: hbf-alpha-console.service
+        state: started
+
+    - name: Confirm controller responds locally
+      ansible.builtin.uri:
+        url: http://127.0.0.1:8088/
+        method: GET
+        status_code: 200
+      register: web_check
+      retries: 5
+      delay: 2
+      until: web_check.status == 200
+
+    - name: Explicitly announce policy not yet applied
+      ansible.builtin.debug:
+        msg: 'Alpha 1.3 code installed; live nftables unchanged. Review Plan/Diff before first manual Deploy.'

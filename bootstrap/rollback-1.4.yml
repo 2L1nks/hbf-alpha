@@ -1,0 +1,51 @@
+---
+# Restore controller source backed up by upgrade-1.4.yml (no agent change).
+- name: HBF Alpha 1.4 - restore previous controller source
+  hosts: controller
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Check backup is present
+      ansible.builtin.stat:
+        path: /var/backups/hbf-alpha/controller-pre-1.4/app.py
+      register: old_app
+      failed_when: not old_app.stat.exists
+
+    - name: Require no running/partial Deploy
+      ansible.builtin.shell: |
+        set -eu
+        python3 - <<'PY'
+        import sqlite3
+        db=sqlite3.connect('file:/var/lib/hbf-alpha-controller/controller.sqlite3?mode=ro', uri=True)
+        count=db.execute("SELECT COUNT(*) FROM deployments WHERE state IN ('running','partial')").fetchone()[0]
+        assert count == 0, 'Resolve running/partial Deploy before rollback'
+        PY
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Restore previous controller files
+      ansible.builtin.copy:
+        src: /var/backups/hbf-alpha/controller-pre-1.4/
+        dest: /opt/hbf-alpha/controller/
+        remote_src: true
+        owner: root
+        group: root
+        mode: preserve
+        directory_mode: '0755'
+
+    - name: Restart previous web console
+      ansible.builtin.systemd_service:
+        name: hbf-alpha-console.service
+        state: restarted
+
+    - name: Verify previous web console
+      ansible.builtin.uri:
+        url: http://127.0.0.1:8088/
+        method: GET
+        status_code: 200
+      register: ui
+      retries: 5
+      delay: 2
+      until: ui.status == 200

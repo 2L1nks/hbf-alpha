@@ -1,1 +1,54 @@
-# HBF Alpha 1.4 R2 — repository initialization
+# Python and tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# Ansible runtime / machine-specific settings
+*.retry
+bootstrap/inventory.local.yml
+bootstrap/inventory.prod.yml
+bootstrap/inventory.production.yml
+bootstrap/group_vars/*/vault.yml
+bootstrap/host_vars/*/vault.yml
+
+# Credentials and private key material
+*.pem
+*.p12
+*.pfx
+*.key
+id_rsa*
+id_ed25519*
+*.pub
+*.kdbx
+vault_password*
+**/known_hosts
+
+# Runtime state; never commit live firewall/controller data
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.log
+*.pid
+*.sock
+*.bak
+*.swp
+*.swo
+*.tmp
+.cache/
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

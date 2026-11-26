@@ -1,0 +1,30 @@
+# Optional Alpha 1.4 demo, both rules disabled. No actual network changes.
+version: 1
+policies:
+  - id: QA14-ALLOW-EXCEPTION
+    name: Example-allow-one-port
+    description: "ACCEPT first, before the larger DROP; default HBF policy remains accept"
+    enabled: false
+    source: kali01
+    destination: kali02
+    family: ipv4
+    protocol: tcp
+    ports: "60010"
+    action: accept
+    priority: 10
+    states: [new]
+
+  - id: QA14-DROP-RANGE
+    name: Example-drop-range
+    description: "Demonstrate ordered rule, logging and CIDR fields"
+    enabled: false
+    source: kali01
+    destination: kali02
+    family: ipv4
+    protocol: tcp
+    ports: ["60010-60020", 60030]
+    src_cidrs: [192.168.100.10/32]
+    dst_cidrs: [192.168.100.20/32]
+    action: drop
+    priority: 100
+    log_drop: true

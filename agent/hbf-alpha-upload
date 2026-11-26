@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+"""Receives an untrusted JSON candidate over SSH as agent_hbf.
+
+No path or command arguments are accepted. Privileged validation occurs in stage.
+"""
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+PATH = Path('/var/lib/hbf-alpha/inbox/candidate.json')
+
+if len(sys.argv) != 1:
+    sys.exit('This command accepts no arguments')
+raw = sys.stdin.buffer.read(131073)
+if not raw or len(raw) > 131072:
+    sys.exit('Invalid candidate size')
+fd, tmp = tempfile.mkstemp(dir=str(PATH.parent), prefix='.candidate-')
+try:
+    with os.fdopen(fd, 'wb') as f:
+        f.write(raw)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, PATH)
+finally:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+print('UPLOADED')

@@ -1,0 +1,362 @@
+---
+- name: HBF Alpha - prepare controller and generate SSH key
+  hosts: controller
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Install controller runtime dependencies
+      ansible.builtin.apt:
+        name:
+          - python3
+          - python3-venv
+          - python3-pip
+          - openssh-client
+        state: present
+        update_cache: false
+
+    - name: Create admin_hbf service group
+      ansible.builtin.group:
+        name: admin_hbf
+        system: true
+
+    - name: Create admin_hbf service account
+      ansible.builtin.user:
+        name: admin_hbf
+        group: admin_hbf
+        system: true
+        create_home: true
+        home: /var/lib/hbf-alpha-controller
+        shell: /usr/sbin/nologin
+        password_lock: true
+
+    - name: Ensure protected controller state
+      ansible.builtin.file:
+        path: /var/lib/hbf-alpha-controller
+        state: directory
+        owner: admin_hbf
+        group: admin_hbf
+        mode: '0700'
+
+    - name: Ensure controller SSH directory
+      ansible.builtin.file:
+        path: /var/lib/hbf-alpha-controller/.ssh
+        state: directory
+        owner: admin_hbf
+        group: admin_hbf
+        mode: '0700'
+
+    - name: Create controller SSH key (no interactive passphrase)
+      ansible.builtin.command:
+        argv:
+          - /usr/sbin/runuser
+          - -u
+          - admin_hbf
+          - --
+          - /usr/bin/ssh-keygen
+          - -t
+          - ed25519
+          - -N
+          - ''
+          - -f
+          - /var/lib/hbf-alpha-controller/.ssh/id_ed25519
+          - -C
+          - hbf-alpha-controller
+        creates: /var/lib/hbf-alpha-controller/.ssh/id_ed25519
+
+    - name: Read controller public key for agent enrollment
+      ansible.builtin.slurp:
+        src: /var/lib/hbf-alpha-controller/.ssh/id_ed25519.pub
+      register: hbf_controller_public_key
+
+    - name: Create root-owned app directory
+      ansible.builtin.file:
+        path: /opt/hbf-alpha/controller
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Install root-owned controller application
+      register: hbf_controller_application
+      ansible.builtin.copy:
+        src: ../controller/
+        dest: /opt/hbf-alpha/controller/
+        owner: root
+        group: root
+        mode: preserve
+        directory_mode: '0755'
+
+    - name: Create venv
+      ansible.builtin.command:
+        cmd: /usr/bin/python3 -m venv /opt/hbf-alpha/venv
+        creates: /opt/hbf-alpha/venv/bin/python
+
+    - name: Install application Python dependencies
+      ansible.builtin.pip:
+        requirements: /opt/hbf-alpha/controller/requirements.txt
+        virtualenv: /opt/hbf-alpha/venv
+
+    - name: Create controller registry directory
+      ansible.builtin.file:
+        path: /etc/hbf-alpha-controller
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Write immutable enrollment registry from Ansible inventory
+      ansible.builtin.copy:
+        dest: /etc/hbf-alpha-controller/hosts.json
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [
+          {% for host in groups['hbf_nodes'] %}
+            {"id": {{ host | to_json }}, "ip": {{ hostvars[host].hbf_host_ip | to_json }}, "ipv6": {{ (hostvars[host].hbf_host_ipv6 | default(none)) | to_json }}, "label": {{ host | to_json }}}{% if not loop.last %},{% endif %}
+          {% endfor %}
+          ]
+
+- name: HBF Alpha - enroll agents on every managed host
+  hosts: hbf_nodes
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Confirm no old HBF tables exist (protect against conflicting managers)
+      ansible.builtin.command: /usr/sbin/nft list tables
+      register: current_tables
+      changed_when: false
+      failed_when: (current_tables.stdout | regex_search("(?m)^table inet (hbf|hbf_block)$")) is not none
+
+    - name: Install agent OS dependencies
+      ansible.builtin.apt:
+        name:
+          - nftables
+          - openssh-server
+          - python3
+          - sudo
+        state: present
+        update_cache: false
+
+    - name: Create agent_hbf service group
+      ansible.builtin.group:
+        name: agent_hbf
+        system: true
+
+    - name: Create agent_hbf service account
+      ansible.builtin.user:
+        name: agent_hbf
+        group: agent_hbf
+        system: true
+        create_home: true
+        home: /home/agent_hbf
+        shell: /bin/sh
+        password_lock: true
+
+    - name: Create SSH directory for agent
+      ansible.builtin.file:
+        path: /home/agent_hbf/.ssh
+        state: directory
+        owner: agent_hbf
+        group: agent_hbf
+        mode: '0700'
+
+    - name: Enroll controller public key restricted to controller IP
+      ansible.builtin.copy:
+        dest: /home/agent_hbf/.ssh/authorized_keys
+        owner: agent_hbf
+        group: agent_hbf
+        mode: '0600'
+        content: >-
+          from="{{ hostvars[groups['controller'][0]].hbf_host_ip }}",restrict
+          {{ (hostvars[groups['controller'][0]].hbf_controller_public_key.content | b64decode).strip() }}
+
+    - name: Create agent state root
+      ansible.builtin.file:
+        path: /var/lib/hbf-alpha
+        state: directory
+        owner: root
+        group: root
+        mode: '0711'
+
+    - name: Create unprivileged upload inbox
+      ansible.builtin.file:
+        path: /var/lib/hbf-alpha/inbox
+        state: directory
+        owner: agent_hbf
+        group: agent_hbf
+        mode: '0700'
+
+    - name: Create root-private transaction state
+      ansible.builtin.file:
+        path: /var/lib/hbf-alpha/state
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: Create committed policy directory
+      ansible.builtin.file:
+        path: /etc/hbf-alpha
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: Install restricted privileged agent
+      ansible.builtin.copy:
+        src: ../agent/hbf-alpha-agent
+        dest: /usr/local/sbin/hbf-alpha-agent
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Install unprivileged candidate upload receiver
+      ansible.builtin.copy:
+        src: ../agent/hbf-alpha-upload
+        dest: /usr/local/bin/hbf-alpha-upload
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Configure only exact permitted agent sudo operations
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/hbf-alpha-agent
+        owner: root
+        group: root
+        mode: '0440'
+        validate: '/usr/sbin/visudo -cf %s'
+        content: |
+          Defaults:agent_hbf !requiretty
+          agent_hbf ALL=(root) NOPASSWD: /usr/local/sbin/hbf-alpha-agent status, /usr/local/sbin/hbf-alpha-agent stage, /usr/local/sbin/hbf-alpha-agent arm, /usr/local/sbin/hbf-alpha-agent apply, /usr/local/sbin/hbf-alpha-agent verify, /usr/local/sbin/hbf-alpha-agent commit, /usr/local/sbin/hbf-alpha-agent rollback, /usr/local/sbin/hbf-alpha-agent quarantine-on, /usr/local/sbin/hbf-alpha-agent quarantine-off
+
+    - name: Configure root-owned quarantine admin source IP
+      ansible.builtin.copy:
+        dest: /etc/hbf-alpha/quarantine-admin-ip
+        owner: root
+        group: root
+        mode: '0644'
+        content: "{{ hostvars[groups['controller'][0]].hbf_host_ip }}\n"
+
+    - name: Install crash recovery / persisted rule boot loader
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/hbf-alpha-restore.service
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=HBF Alpha transactional recovery and boot policy
+          After=nftables.service
+          ConditionPathExists=/usr/local/sbin/hbf-alpha-agent
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/hbf-alpha-agent boot
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Enable HBF Alpha boot recovery
+      ansible.builtin.systemd_service:
+        name: hbf-alpha-restore.service
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Read target SSH public host key (for pinning on controller)
+      ansible.builtin.slurp:
+        src: /etc/ssh/ssh_host_ed25519_key.pub
+      register: hbf_ssh_host_public
+
+    - name: Validate local agent status
+      ansible.builtin.command: /usr/local/sbin/hbf-alpha-agent status
+      changed_when: false
+
+- name: HBF Alpha - finalize controller web service and known hosts
+  hosts: controller
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Pin managed SSH host keys (read from each machine via Ansible)
+      ansible.builtin.copy:
+        dest: /var/lib/hbf-alpha-controller/.ssh/known_hosts
+        owner: admin_hbf
+        group: admin_hbf
+        mode: '0600'
+        content: |
+          {% for host in groups['hbf_nodes'] %}
+          {{ hostvars[host].hbf_host_ip }} {{ (hostvars[host].hbf_ssh_host_public.content | b64decode).strip() }}
+          {% endfor %}
+
+    - name: Install hardened loopback-only web service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/hbf-alpha-console.service
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=HBF Alpha Console
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          User=admin_hbf
+          Group=admin_hbf
+          WorkingDirectory=/opt/hbf-alpha/controller
+          Environment=HBF_CONTROLLER_HOME=/var/lib/hbf-alpha-controller
+          Environment=HBF_REGISTRY=/etc/hbf-alpha-controller/hosts.json
+          ExecStart=/opt/hbf-alpha/venv/bin/uvicorn app:app --host 127.0.0.1 --port 8088 --workers 1
+          Restart=on-failure
+          RestartSec=3
+          NoNewPrivileges=true
+          PrivateTmp=true
+          ProtectSystem=strict
+          ProtectHome=true
+          ReadWritePaths=/var/lib/hbf-alpha-controller
+          UMask=0077
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Enable and start web application
+      ansible.builtin.systemd_service:
+        name: hbf-alpha-console.service
+        enabled: true
+        state: "{{ 'restarted' if hostvars[inventory_hostname].hbf_controller_application.changed else 'started' }}"
+        daemon_reload: true
+
+    - name: Verify admin_hbf can SSH to each enrolled agent
+      ansible.builtin.command:
+        argv:
+          - /usr/sbin/runuser
+          - -u
+          - admin_hbf
+          - --
+          - /usr/bin/ssh
+          - -F
+          - /dev/null
+          - -T
+          - -o
+          - BatchMode=yes
+          - -o
+          - IdentitiesOnly=yes
+          - -o
+          - StrictHostKeyChecking=yes
+          - -o
+          - UserKnownHostsFile=/var/lib/hbf-alpha-controller/.ssh/known_hosts
+          - -i
+          - /var/lib/hbf-alpha-controller/.ssh/id_ed25519
+          - "agent_hbf@{{ hostvars[item].hbf_host_ip }}"
+          - sudo
+          - -n
+          - /usr/local/sbin/hbf-alpha-agent
+          - status
+      loop: "{{ groups['hbf_nodes'] }}"
+      changed_when: false
+
+    - name: Installation completed
+      ansible.builtin.debug:
+        msg: 'Create web admin with sudo -u admin_hbf /opt/hbf-alpha/venv/bin/python /opt/hbf-alpha/controller/app.py init-admin, then open http://127.0.0.1:8088'

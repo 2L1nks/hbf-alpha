@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>HBF Alpha 1.4 R2 | Firewall Control</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div id="login" class="login-view hidden">
+    <form id="loginForm" class="login-card">
+      <div class="brand-mark">H</div>
+      <p class="eyebrow">HOST-BASED FIREWALL</p>
+      <h1>Войти в HBF</h1>
+      <p class="muted">Локальная консоль управления политиками</p>
+      <label>Логин<input id="username" autocomplete="username" required></label>
+      <label>Пароль<input id="password" type="password" autocomplete="current-password" required></label>
+      <p id="loginError" class="error"></p>
+      <button class="btn primary" type="submit">Войти</button>
+    </form>
+  </div>
+
+  <div id="layout" class="shell hidden">
+    <aside class="sidebar">
+      <div class="brand"><div class="brand-mark">H</div><div><b>HBF <span>ALPHA</span></b><small>Firewall Control Plane</small></div></div>
+      <div class="sidebar-divider"></div>
+      <nav id="nav">
+        <button data-page="dashboard" class="active"><span>▦</span> Обзор</button>
+        <button data-page="hosts"><span>▤</span> Хосты</button>
+        <button data-page="policies"><span>⬡</span> Политики</button>
+        <button data-page="topology"><span>◉</span> Топология</button>
+        <button data-page="deploy"><span>⇧</span> Развёртывание</button>
+        <button data-page="history"><span>↶</span> Версии и восстановление</button>
+        <button data-page="logs"><span>≡</span> Журналы</button>
+        <button data-page="audit"><span>▤</span> Аудит</button>
+        <button data-page="settings"><span>⚙</span> Система</button>
+      </nav>
+      <div class="sidebar-foot"><div class="status-dot"></div><div><b>HBF Alpha 1.4 R2</b><small>Лабораторная версия</small></div></div>
+    </aside>
+    <main class="main">
+      <header class="topbar"><div><span class="eyebrow">HBF / CONTROL CENTER</span><h2 id="pageTitle">Обзор</h2></div><div class="topright"><span class="user-pill" id="userPill">admin</span><button class="btn soft" id="logoutBtn">Выход</button></div></header>
+      <div id="notice"></div>
+      <section class="content" id="page"></section>
+      <footer>HBF Alpha — тестовый контур · только разрешённые DROP-политики · SSH/22 защищён</footer>
+    </main>
+  </div>
+  <dialog id="modal"><div id="modalBody"></div></dialog>
+  <script src="/static/topology.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,10 @@
+HBF ALPHA 1.4 R2 - OFFLINE DEVELOPER TESTS
+Date: 2026-11-26
+Python unittest discover: 88 tests, OK (67 inherited + 21 new)
+Node: --check controller/static/app.js: PASS
+Node: --check controller/static/topology.js: PASS
+Node topology smoke: PASS
+Python syntax compilation: PASS
+Example original (legacy SSH/22): preview returns HTTP 422 as designed
+Corrected YAML: preview HTTP 200, 2 additions; isolated DB import HTTP 200, no Deploy
+No real Kali deployment performed for Alpha 1.4 R2. Re-test on Kali-1 / Kali-2 before production.

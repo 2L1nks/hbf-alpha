@@ -1,0 +1,553 @@
+#!/usr/bin/env python3
+"""HBF Alpha 1.3: isolated, validated nftables transaction agent.
+
+Only a single inet/hbf_alpha table can be changed. Incoming candidate JSON is
+compiled using strict allowlists; uploaded shell/nft commands are never run.
+"""
+import collections
+import fcntl
+import ipaddress
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path('/var/lib/hbf-alpha/state')
+INBOX = Path('/var/lib/hbf-alpha/inbox/candidate.json')
+LIVE = Path('/etc/hbf-alpha/rules.nft')
+LOCK = Path('/run/hbf-alpha-agent.lock')
+AGENT_BIN = '/usr/local/sbin/hbf-alpha-agent'
+TABLE = 'hbf_alpha'
+QUARANTINE_TABLE = 'hbf_quarantine'
+QUARANTINE_MARKER = ROOT / 'quarantine-enabled'
+QUARANTINE_ADMIN_IP = Path('/etc/hbf-alpha/quarantine-admin-ip')
+MAX_BYTES = 131072
+VALID_ID = re.compile(r'^[A-Za-z0-9_-]{1,48}$')
+ALLOWED_COMMANDS = {'status', 'stage', 'arm', 'apply', 'verify', 'commit', 'rollback', 'timeout', 'boot', 'quarantine-on', 'quarantine-off'}
+STATES = ('new', 'established', 'related')
+ICMP_V4_TYPES = {'echo-request', 'echo-reply', 'destination-unreachable', 'time-exceeded'}
+ICMP_V6_TYPES = {'echo-request', 'echo-reply'}  # Never block NDP/RA by mistake.
+MAX_CIDRS = 16
+MAX_RANGES = 32
+PROTECTED_PORTS = (22, 8088)
+
+
+def sh(args, *, check=True):
+    return subprocess.run(args, text=True, capture_output=True, check=check, timeout=35)
+
+
+def atomic(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix='.hbf-')
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(data if isinstance(data, bytes) else data.encode())
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def nofollow_json(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        s = os.fstat(fd)
+        if not stat.S_ISREG(s.st_mode) or s.st_size > MAX_BYTES or s.st_size == 0:
+            raise ValueError('Invalid candidate size/type')
+        data = os.read(fd, MAX_BYTES + 1)
+        if len(data) > MAX_BYTES:
+            raise ValueError('Candidate too large')
+        return json.loads(data)
+    finally:
+        os.close(fd)
+
+
+def local_addresses(version):
+    family = '-6' if version == 6 else '-4'
+    output = sh(['/usr/sbin/ip', '-o', family, 'addr', 'show']).stdout
+    found = set()
+    for token in output.split():
+        if '/' not in token:
+            continue
+        try:
+            address = ipaddress.ip_interface(token).ip
+            if address.version == version:
+                found.add(address)
+        except ValueError:
+            continue
+    return found
+
+
+def local_ip(ip):
+    addr = ipaddress.ip_address(ip)
+    return addr in local_addresses(addr.version)
+
+
+def local_ipv4(ip):
+    return local_ip(ip)
+
+
+def canon_networks(value, family):
+    if not isinstance(value, list) or not 1 <= len(value) <= MAX_CIDRS:
+        raise ValueError('CIDR list size must be 1..16')
+    out = []
+    for item in value:
+        if not isinstance(item, str) or len(item) > 52:
+            raise ValueError('Invalid CIDR value')
+        net = ipaddress.ip_network(item, strict=False)
+        if net.version != family:
+            raise ValueError('Mixed IP families in rule')
+        canonical = str(net)
+        if canonical not in out:
+            out.append(canonical)
+    return [str(n) for n in ipaddress.collapse_addresses(ipaddress.ip_network(v) for v in out)]
+
+
+def canon_ranges(value):
+    if not isinstance(value, list) or not 1 <= len(value) <= MAX_RANGES:
+        raise ValueError('Invalid port ranges count')
+    out = []
+    for pair in value:
+        if (not isinstance(pair, list) or len(pair) != 2 or
+                any(type(v) is not int or not 1 <= v <= 65535 for v in pair) or pair[0] > pair[1]):
+            raise ValueError('Invalid port range')
+        if any(pair[0] <= p <= pair[1] for p in PROTECTED_PORTS):
+            raise ValueError('Protected management port inside range/list')
+        out.append((pair[0], pair[1]))
+    out.sort()
+    for idx in range(1, len(out)):
+        if out[idx][0] <= out[idx - 1][1]:
+            raise ValueError('Overlapping or duplicate port ranges')
+    return [list(v) for v in out]
+
+
+def validate(doc):
+    if not isinstance(doc, dict) or doc.get('version') not in (1, 2):
+        raise ValueError('Unsupported candidate version')
+    if type(doc['version']) is not int:
+        raise ValueError('Invalid version')
+    version = doc['version']
+    required = {'version', 'host_ip', 'rules'} if version == 1 else {'version', 'host_ip', 'host_ipv6', 'rules'}
+    if set(doc) != required:
+        raise ValueError('Invalid candidate schema')
+    host_ip = str(ipaddress.IPv4Address(doc['host_ip']))
+    if not local_ipv4(host_ip):
+        raise ValueError('Candidate host_ip does not match local interface')
+    host_ipv6 = None
+    if version == 2 and doc['host_ipv6'] is not None:
+        host_ipv6 = str(ipaddress.IPv6Address(doc['host_ipv6']))
+        if not ipaddress.ip_address(host_ipv6).is_global and not ipaddress.ip_address(host_ipv6).is_private:
+            raise ValueError('Invalid enrolled IPv6 address')
+    rules = doc['rules']
+    if not isinstance(rules, list) or len(rules) > 512:
+        raise ValueError('Invalid number of rules')
+    seen, clean = set(), []
+    local_cache = {}
+    for r in rules:
+        if not isinstance(r, dict):
+            raise ValueError('Invalid rule type')
+        rid = r.get('id')
+        if not isinstance(rid, str) or not VALID_ID.fullmatch(rid):
+            raise ValueError('Invalid rule ID')
+        direction = r.get('direction')
+        if direction not in ('input', 'output'):
+            raise ValueError('Invalid direction')
+        key = (rid, direction)
+        if key in seen:
+            raise ValueError('Duplicate rule')
+        seen.add(key)
+        if version == 1:
+            if set(r) != {'id', 'source', 'destination', 'proto', 'port', 'direction'}:
+                raise ValueError('Invalid legacy rule schema')
+            source = str(ipaddress.IPv4Address(r['source']))
+            destination = str(ipaddress.IPv4Address(r['destination']))
+            if (direction == 'input' and destination != host_ip) or (direction == 'output' and source != host_ip):
+                raise ValueError('Legacy rule not applicable to target host')
+            if r['proto'] not in ('tcp', 'udp') or type(r['port']) is not int:
+                raise ValueError('Invalid legacy proto/port')
+            port = canon_ranges([[r['port'], r['port']]])[0][0]
+            clean.append({'id':rid, 'direction':direction, 'family':'ipv4',
+                          'source':[source + '/32'], 'destination':[destination + '/32'],
+                          'proto':r['proto'], 'ports':[[port, port]], 'action':'drop',
+                          'states':[], 'log_drop':False, 'icmp_type':'', 'priority':100})
+            continue
+        if set(r) != {'id', 'direction', 'family', 'source', 'destination', 'proto',
+                      'ports', 'action', 'states', 'log_drop', 'icmp_type', 'priority'}:
+            raise ValueError('Invalid v2 rule schema')
+        family = r['family']
+        if family not in ('ipv4', 'ipv6'):
+            raise ValueError('Unknown address family')
+        address_family = 4 if family == 'ipv4' else 6
+        source = canon_networks(r['source'], address_family)
+        destination = canon_networks(r['destination'], address_family)
+        anchor = host_ip if address_family == 4 else host_ipv6
+        if not anchor:
+            raise ValueError('IPv6 requires enrolled host_ipv6 on both endpoints')
+        if address_family == 6 and not local_ip(host_ipv6):
+            raise ValueError('Enrolled IPv6 not configured on local host')
+        actual_networks = source if direction == 'output' else destination
+        nets = [ipaddress.ip_network(v) for v in actual_networks]
+        # The management/enrolled IP may be different from a data-plane IP on
+        # another local interface (e.g. management VLAN vs service VLAN).
+        # Never accept an entirely remote match that this host cannot own.
+        if not any(ipaddress.ip_address(anchor) in net for net in nets):
+            if address_family not in local_cache:
+                local_cache[address_family] = local_addresses(address_family)
+            if not any(addr in net for addr in local_cache[address_family] for net in nets):
+                raise ValueError('Neither enrolled nor local interface IP belongs to endpoint CIDR list')
+        proto = r['proto']
+        if proto not in (('tcp', 'udp', 'icmp') if address_family == 4 else ('tcp', 'udp', 'icmpv6')):
+            raise ValueError('Invalid family/protocol combination')
+        if proto in ('tcp', 'udp'):
+            ports = canon_ranges(r['ports'])
+            if r['icmp_type'] != '':
+                raise ValueError('ICMP type not valid for TCP/UDP')
+            icmp_type = ''
+        else:
+            if r['ports'] != []:
+                raise ValueError('ICMP cannot have ports')
+            icmp_type = r['icmp_type']
+            if icmp_type not in (ICMP_V4_TYPES if proto == 'icmp' else ICMP_V6_TYPES):
+                raise ValueError('Unsafe/invalid ICMP type (IPv6 NDP is not filterable)')
+            ports = []
+        action = r['action']
+        if action not in ('accept', 'drop', 'reject'):
+            raise ValueError('Invalid verdict')
+        states = r['states']
+        if (not isinstance(states, list) or len(states) > len(STATES) or
+                any(x not in STATES for x in states) or len(set(states)) != len(states)):
+            raise ValueError('Invalid connection states')
+        priority = r['priority']
+        if type(priority) is not int or not 1 <= priority <= 10000:
+            raise ValueError('Invalid priority')
+        if type(r['log_drop']) is not bool or (r['log_drop'] and action != 'drop'):
+            raise ValueError('DROP logging can only be used with DROP rules')
+        clean.append({'id':rid, 'direction':direction, 'family':family,
+                      'source':source,'destination':destination,'proto':proto,
+                      'ports':ports,'action':action,'states':sorted(states),
+                      'log_drop':r['log_drop'],'icmp_type':icmp_type,'priority':priority})
+    return sorted(clean, key=lambda r: (r['direction'], r['priority'], r['id']))
+
+
+def net_expr(field, values):
+    def display(net):
+        addr = ipaddress.ip_network(net)
+        return str(addr.network_address) if addr.prefixlen == addr.max_prefixlen else str(addr)
+    rendered = [display(v) for v in values]
+    return field + ' ' + (rendered[0] if len(rendered) == 1 else '{ ' + ', '.join(rendered) + ' }')
+
+
+def port_expr(port_ranges):
+    parts = [str(a) if a == b else f'{a}-{b}' for a, b in port_ranges]
+    return parts[0] if len(parts) == 1 else '{ ' + ', '.join(parts) + ' }'
+
+
+def compile_nft(rules):
+    lines = ['# HBF Alpha 1.2 generated. Do not edit.',
+             'table inet hbf_alpha {}', 'delete table inet hbf_alpha',
+             'table inet hbf_alpha {']
+    for direction in ('output', 'input'):
+        lines += ['  chain ' + direction + ' {',
+                  '    type filter hook ' + direction + ' priority -10; policy accept;']
+        for r in sorted((r for r in rules if r['direction'] == direction), key=lambda v:(v['priority'],v['id'])):
+            family = 'ip6' if r['family'] == 'ipv6' else 'ip'
+            parts = [net_expr(family + ' saddr', r['source']), net_expr(family + ' daddr', r['destination'])]
+            if r['proto'] in ('tcp', 'udp'):
+                parts += [r['proto'] + ' dport ' + port_expr(r['ports'])]
+            elif r['proto'] == 'icmp':
+                parts += ['icmp type ' + r['icmp_type']]
+            else:
+                parts += ['icmpv6 type ' + r['icmp_type']]
+            if r['states']:
+                parts += ['ct state ' + (r['states'][0] if len(r['states']) == 1
+                                        else '{ ' + ', '.join(r['states']) + ' }')]
+            match = ' '.join(parts)
+            if r['log_drop']:
+                # MUST be non-terminal. Rate limiting the DROP itself would leak packets.
+                lines.append(f'    {match} limit rate 3/second burst 5 packets log prefix "HBF DROP {r["id"]} " level info comment "HBF:LOG:{r["id"]}"')
+            verdict = 'reject with icmpx type admin-prohibited' if r['action'] == 'reject' else r['action']
+            lines.append(f'    {match} counter {verdict} comment "HBF:{r["id"]}"')
+        lines.append('  }')
+    lines.append('}')
+    return '\n'.join(lines) + '\n'
+
+
+
+def quarantine_table_exists():
+    return sh(['/usr/sbin/nft', 'list', 'table', 'inet', QUARANTINE_TABLE], check=False).returncode == 0
+
+
+def quarantine_rules(controller_ip):
+    """Host-local quarantine: all routed/non-loopback IPv4+IPv6 denied.
+
+    The only network exception is inbound SSH from the pinned controller IPv4
+    plus SSH replies to it; all OTHER local/forwarded traffic is dropped.
+    An accept in this chain never overrides DROP in another base chain.
+    """
+    ip = str(ipaddress.IPv4Address(controller_ip))
+    if ipaddress.IPv4Address(ip).is_unspecified or ipaddress.IPv4Address(ip).is_multicast:
+        raise ValueError('Invalid quarantine controller IP')
+    return (f'table inet {QUARANTINE_TABLE} {{}}\n'
+            f'delete table inet {QUARANTINE_TABLE}\n'
+            f'table inet {QUARANTINE_TABLE} {{\n'
+            ' chain input { type filter hook input priority -200; policy drop;\n'
+            '   iifname "lo" accept\n'
+            f'   ip saddr {ip} tcp dport 22 accept\n'
+            ' }\n'
+            ' chain output { type filter hook output priority -200; policy drop;\n'
+            '   oifname "lo" accept\n'
+            f'   ip daddr {ip} tcp sport 22 accept\n'
+            ' }\n'
+            ' chain forward { type filter hook forward priority -200; policy drop; }\n'
+            '}\n')
+
+
+def quarantine_controller_ip():
+    st = QUARANTINE_ADMIN_IP.stat()
+    if st.st_uid != 0 or (st.st_mode & 0o022):
+        raise ValueError('Unsafe quarantine-controller config permissions')
+    return str(ipaddress.IPv4Address(QUARANTINE_ADMIN_IP.read_text().strip()))
+
+
+def enforce_quarantine():
+    # A quarantined machine must be inaccessible by ordinary services on
+    # IPv4 and IPv6, including non-host forwarding paths.
+    script = quarantine_rules(quarantine_controller_ip())
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.nft', dir='/run', delete=False) as f:
+        file = Path(f.name)
+        f.write(script)
+    try:
+        sh(['/usr/sbin/nft', '-c', '-f', str(file)])
+        sh(['/usr/sbin/nft', '-f', str(file)])
+    finally:
+        file.unlink(missing_ok=True)
+    if not quarantine_table_exists():
+        raise ValueError('Quarantine nft table missing after application')
+
+
+def quarantine_on():
+    if (ROOT / 'pending').exists():
+        raise ValueError('Cannot quarantine with pending transaction')
+    if QUARANTINE_MARKER.exists() and quarantine_table_exists():
+        return 'ALREADY_QUARANTINED'
+    # Store the desired state *before* applying the nft batch. If a host
+    # crashes during activation, boot restores a persistent quarantine.
+    atomic(QUARANTINE_MARKER, '1\n')
+    try:
+        enforce_quarantine()
+    except Exception:
+        # No half-applied quarantine should remain from a failed activation.
+        if not quarantine_table_exists():
+            QUARANTINE_MARKER.unlink(missing_ok=True)
+        raise
+    return 'QUARANTINED'
+
+
+def quarantine_off():
+    if (ROOT / 'pending').exists():
+        raise ValueError('Cannot release quarantine with pending transaction')
+    if quarantine_table_exists():
+        sh(['/usr/sbin/nft', 'delete', 'table', 'inet', QUARANTINE_TABLE])
+    QUARANTINE_MARKER.unlink(missing_ok=True)
+    return 'QUARANTINE_RELEASED'
+
+
+def table_exists():
+    return sh(['/usr/sbin/nft', 'list', 'table', 'inet', TABLE], check=False).returncode == 0
+
+
+def snapshot():
+    script = 'table inet hbf_alpha {}\ndelete table inet hbf_alpha\n'
+    if table_exists():
+        script += sh(['/usr/sbin/nft', '-s', 'list', 'table', 'inet', TABLE]).stdout
+    return script
+
+
+def cancel_timer():
+    unit_file = ROOT / 'timer-unit'
+    if unit_file.exists():
+        unit = unit_file.read_text().strip()
+        if re.fullmatch(r'hbf-alpha-rollback-[0-9]+', unit):
+            sh(['/usr/bin/systemctl', 'stop', unit + '.timer'], check=False)
+        unit_file.unlink(missing_ok=True)
+
+
+def do_rollback():
+    if not (ROOT / 'pending').exists():
+        raise ValueError('No pending transaction to roll back')
+    if not (ROOT / 'previous.nft').exists():
+        raise ValueError('Missing previous table snapshot')
+    if (ROOT / 'previous-boot-present').exists():
+        atomic(LIVE, (ROOT / 'previous-boot.nft').read_bytes())
+    else:
+        LIVE.unlink(missing_ok=True)
+    sh(['/usr/sbin/nft', '-f', str(ROOT / 'previous.nft')])
+    (ROOT / 'pending').unlink()
+    cancel_timer()
+    return 'ROLLED_BACK'
+
+
+def status():
+    return {'state':'PENDING' if (ROOT/'pending').exists() else 'CLEAN',
+            'table_exists':table_exists(), 'boot_policy':LIVE.is_file(), 'schema':3,
+            'quarantined':quarantine_table_exists(),
+            'quarantine_desired':QUARANTINE_MARKER.is_file()}
+
+
+def stage():
+    if QUARANTINE_MARKER.exists() or quarantine_table_exists():
+        raise ValueError('Deploy blocked while host is quarantined')
+    if (ROOT/'pending').exists():
+        raise ValueError('Pending transaction; refuse stage')
+    doc = nofollow_json(INBOX)
+    rules = validate(doc)
+    candidate = compile_nft(rules)
+    atomic(ROOT/'candidate.nft',candidate)
+    sh(['/usr/sbin/nft','-c','-f',str(ROOT/'candidate.nft')])
+    expected = []
+    for direction in ('output','input'):
+        for r in (v for v in rules if v['direction']==direction):
+            if r['log_drop']:
+                expected.append({'id':'LOG:'+r['id'], 'direction':r['direction'], 'verdict':'log'})
+            expected.append({'id':r['id'], 'direction':r['direction'], 'verdict':r['action']})
+    atomic(ROOT/'expected.json',json.dumps(expected))
+    atomic(ROOT/'previous.nft',snapshot())
+    sh(['/usr/sbin/nft','-c','-f',str(ROOT/'previous.nft')])
+    if LIVE.is_file():
+        atomic(ROOT/'previous-boot.nft', LIVE.read_bytes())
+        atomic(ROOT/'previous-boot-present','1')
+    else:
+        (ROOT/'previous-boot.nft').unlink(missing_ok=True)
+        (ROOT/'previous-boot-present').unlink(missing_ok=True)
+    return 'STAGED'
+
+
+def arm():
+    if QUARANTINE_MARKER.exists() or quarantine_table_exists():
+        raise ValueError('Deploy blocked while host is quarantined')
+    if (ROOT/'pending').exists():
+        raise ValueError('Already pending')
+    for name in ('candidate.nft','previous.nft','expected.json'):
+        if not (ROOT/name).is_file():
+            raise ValueError('Not staged')
+    atomic(ROOT/'pending','1')
+    unit = 'hbf-alpha-rollback-' + str(os.getpid())
+    atomic(ROOT/'timer-unit',unit)
+    try:
+        sh(['/usr/bin/systemd-run','--unit='+unit,'--on-active=600s',AGENT_BIN,'timeout'])
+    except Exception:
+        do_rollback()
+        raise
+    return 'ARMED (600s watchdog)'
+
+
+def apply():
+    if QUARANTINE_MARKER.exists() or quarantine_table_exists():
+        raise ValueError('Deploy blocked while host is quarantined')
+    if not (ROOT/'pending').exists():
+        raise ValueError('Not armed')
+    try:
+        sh(['/usr/sbin/nft','-f',str(ROOT/'candidate.nft')])
+    except Exception:
+        do_rollback()
+        raise
+    return 'APPLIED'
+
+
+def verify():
+    if not (ROOT/'pending').exists():
+        raise ValueError('Not armed')
+    expected = json.loads((ROOT/'expected.json').read_text())
+    data = json.loads(sh(['/usr/sbin/nft','-j','list','table','inet',TABLE]).stdout)
+    found,all_rules=[],[]
+    for element in data.get('nftables',[]):
+        r=element.get('rule')
+        if not r:
+            continue
+        all_rules.append(r)
+        comment=r.get('comment','')
+        if not isinstance(comment,str) or not comment.startswith('HBF:'):
+            continue
+        expressions=r.get('expr',[])
+        if not isinstance(expressions,list):
+            raise ValueError('Invalid nft JSON rule expressions')
+        verdicts=[name for obj in expressions if isinstance(obj,dict)
+                  for name in ('accept','drop','reject','log') if name in obj]
+        if len(verdicts)!=1:
+            raise ValueError('Rule must have exactly one matching verdict/log')
+        found.append({'id':comment[4:],'direction':r.get('chain'),'verdict':verdicts[0]})
+    # Check order and action as well as IDs. Logging rules must precede the
+    # matching unconditional terminal DROP, not accidentally rate-limit it.
+    if expected!=found or len(all_rules)!=len(expected):
+        raise ValueError('HBF rule IDs/directions/verdicts/order/count do not match')
+    return 'VERIFIED'
+
+
+def commit():
+    if not (ROOT/'pending').exists():
+        raise ValueError('Not armed')
+    verify()
+    atomic(LIVE,(ROOT/'candidate.nft').read_bytes())
+    (ROOT/'pending').unlink()
+    cancel_timer()
+    return 'COMMITTED'
+
+
+def boot():
+    if (ROOT/'pending').exists():
+        if (ROOT/'previous-boot-present').exists():
+            atomic(LIVE,(ROOT/'previous-boot.nft').read_bytes())
+        else:
+            LIVE.unlink(missing_ok=True)
+        (ROOT/'pending').unlink()
+        cancel_timer()
+    if LIVE.is_file():
+        sh(['/usr/sbin/nft','-f',str(LIVE)])
+    if QUARANTINE_MARKER.exists():
+        enforce_quarantine()
+    elif quarantine_table_exists():
+        # Recover from a killed release: marker absent means normal mode.
+        sh(['/usr/sbin/nft', 'delete', 'table', 'inet', QUARANTINE_TABLE])
+    return 'BOOT_OK'
+
+
+def dispatch(cmd):
+    if cmd=='status': return json.dumps(status(),sort_keys=True)
+    if cmd=='stage': return stage()
+    if cmd=='arm': return arm()
+    if cmd=='apply': return apply()
+    if cmd=='verify': return verify()
+    if cmd=='commit': return commit()
+    if cmd=='rollback': return do_rollback()
+    if cmd=='timeout': return do_rollback() if (ROOT/'pending').exists() else 'ALREADY_CLEAN'
+    if cmd=='boot': return boot()
+    if cmd=='quarantine-on': return quarantine_on()
+    if cmd=='quarantine-off': return quarantine_off()
+    raise ValueError('Unknown command')
+
+
+def main():
+    if os.geteuid()!=0:
+        sys.exit('Must run as root')
+    if len(sys.argv)!=2 or sys.argv[1] not in ALLOWED_COMMANDS:
+        sys.exit('Usage: hbf-alpha-agent {status|stage|arm|apply|verify|commit|rollback|timeout|boot|quarantine-on|quarantine-off}')
+    os.umask(0o077)
+    ROOT.mkdir(parents=True,exist_ok=True,mode=0o700)
+    ROOT.chmod(0o700)
+    with LOCK.open('a+') as f:
+        fcntl.flock(f,fcntl.LOCK_EX)
+        try:
+            print(dispatch(sys.argv[1]))
+        except (OSError,ValueError,subprocess.SubprocessError,json.JSONDecodeError) as err:
+            sys.stderr.write('HBF agent error: %s\n' % (err.stderr.strip() if isinstance(err,subprocess.CalledProcessError) and err.stderr else err))
+            sys.exit(1)
+
+if __name__=='__main__':
+    main()

@@ -1,0 +1,10 @@
+<!doctype html><html lang="ru"><head><meta charset="utf-8"><link rel="stylesheet" href="../controller/static/style.css"><style>body{margin:0;padding:22px;background:#f4f6fa}#main{max-width:1280px;margin:auto}</style></head><body><main id="main"></main><script src="../controller/static/topology.js"></script><script>
+const nodes=[];
+for(let i=0;i<35;i++)nodes.push({id:'host'+i,label:'Host '+i,ip:'10.0.0.'+(i+1),grp:['MGMT','DB','APP','BACKUP','DMZ'][i%5],enabled:1,zone:'Lab',role:'test'});
+const edges=[],pairs=new Map();let idx=0;
+function add(a,b,port){const key=a+'-'+b;if(!pairs.has(key))pairs.set(key,[]);pairs.get(key).push({id:'P-'+(++idx),name:'DROP rule '+idx,src:a,dst:b,port,proto:'tcp',enabled:1});}
+for(let i=0;i<35;i++)for(let j=0;j<17;j++){let dst=(i+j*3)%35;add('host'+i,'host'+dst,1100+j)}
+for(const [key,rules] of pairs){edges.push({id:key,source:rules[0].src,target:rules[0].dst,rules,policy_count:rules.length})}
+const model={nodes,groups:[...new Set(nodes.map(h=>h.grp))].map(id=>({id})),edges};
+window.HBFTopology.render(document.querySelector('#main'),{model,agents:[],summary:{}});
+</script></body></html>

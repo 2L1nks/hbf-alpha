@@ -1,0 +1,102 @@
+---
+# Controller-only Alpha 1.4 R2 patch. No agent, sudoers, or nft changes.
+- name: HBF Alpha 1.4 - verify remote agents in a safe state
+  hosts: hbf_nodes
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Confirm v3 agent is clean and not quarantined
+      ansible.builtin.command: /usr/local/sbin/hbf-alpha-agent status
+      register: before_agent
+      changed_when: false
+      failed_when: >-
+        (before_agent.stdout | from_json).schema | int != 3 or
+        (before_agent.stdout | from_json).state != 'CLEAN' or
+        (before_agent.stdout | from_json).quarantined | bool or
+        (before_agent.stdout | from_json).quarantine_desired | bool
+
+- name: HBF Alpha 1.4 - patch controller only; preserve DB and agent state
+  hosts: controller
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Require controller service and Python venv
+      ansible.builtin.stat:
+        path: /opt/hbf-alpha/venv/bin/python
+      register: controller_venv
+      failed_when: not controller_venv.stat.exists
+
+    - name: Stop if deployment is unresolved
+      ansible.builtin.shell: |
+        set -eu
+        python3 - <<'PY'
+        import sqlite3
+        p='/var/lib/hbf-alpha-controller/controller.sqlite3'
+        db=sqlite3.connect('file:'+p+'?mode=ro',uri=True)
+        n=db.execute("SELECT COUNT(*) FROM deployments WHERE state IN ('running','partial')").fetchone()[0]
+        assert n == 0, 'Running/partial deployment; resolve before upgrade'
+        print('DEPLOYMENTS_CLEAN')
+        PY
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Install one YAML parsing dependency into the existing controller venv
+      ansible.builtin.pip:
+        name: 'PyYAML>=6.0.2,<7'
+        executable: /opt/hbf-alpha/venv/bin/pip
+
+    - name: Create backups directory
+      ansible.builtin.file:
+        path: /var/backups/hbf-alpha
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: Create backup of currently installed controller
+      ansible.builtin.command:
+        argv:
+          - /bin/cp
+          - -a
+          - /opt/hbf-alpha/controller
+          - /var/backups/hbf-alpha/controller-pre-1.4
+      args:
+        creates: /var/backups/hbf-alpha/controller-pre-1.4
+
+    - name: Install new controller modules and static UI
+      ansible.builtin.copy:
+        src: ../controller/
+        dest: /opt/hbf-alpha/controller/
+        owner: root
+        group: root
+        mode: preserve
+        directory_mode: '0755'
+
+    - name: Check Python syntax and imported PyYAML
+      ansible.builtin.command:
+        argv:
+          - /opt/hbf-alpha/venv/bin/python
+          - -c
+          - 'import yaml,sys;sys.path.insert(0,"/opt/hbf-alpha/controller");import app,yaml_io;print("ALPHA_1_4_IMPORT_OK")'
+      changed_when: false
+
+    - name: Restart controller to load updated endpoints
+      ansible.builtin.systemd_service:
+        name: hbf-alpha-console.service
+        state: restarted
+
+    - name: Verify UI is reachable locally after patch
+      ansible.builtin.uri:
+        url: http://127.0.0.1:8088/
+        method: GET
+        status_code: 200
+      register: ui_check
+      retries: 5
+      delay: 2
+      until: ui_check.status == 200
+
+    - name: Confirm no firewall mutation was performed
+      ansible.builtin.debug:
+        msg: 'Alpha 1.4 R2 controller patch installed. Agents and nftables unchanged; YAML imports require separate Plan/Diff and Deploy.'
